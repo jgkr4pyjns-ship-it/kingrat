@@ -32,18 +32,18 @@ async function getMediaMetadata(type, id) {
 }
 
 // ---------------------------------------------------------
-// QUALITY EXTRACTOR (Prevents Stremio from hiding streams)
+// QUALITY EXTRACTOR
 // ---------------------------------------------------------
 function extractQuality(title) {
   const t = title.toLowerCase();
-  if (t.includes('4k') || t.includes('uhd') || t.includes('2160p')) return '4K UHD 💎';
-  if (t.includes('1080p') || t.includes('fhd')) return '1080p FHD';
-  if (t.includes('720p') || t.includes('hd')) return '720p HD';
-  return 'SD / Unknown';
+  if (/4k|uhd|2160/.test(t)) return '4K';
+  if (/1080|fhd/.test(t)) return '1080p';
+  if (/720|hd/.test(t)) return '720p';
+  return 'SD';
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (Upgraded to fetch multiple pages)
+// STALKER SEARCH (Fixed Page 0 Bug & Deduplication)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
@@ -57,15 +57,16 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     if (handshake.data?.js?.token) headers['Authorization'] = `Bearer ${handshake.data.js.token}`;
 
     let results = [];
+    const seenUrls = new Set(); // Prevents duplicates if the portal ignores pagination
     
-    // Loop through up to 4 pages to bypass the 14-item Stalker limit
-    for (let page = 1; page <= 4; page++) {
+    // FIX: Start at page 0! Many portals skip the first 14 results if you start at p=1.
+    for (let page = 0; page <= 5; page++) {
       const searchUrl = `${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(searchQuery)}&p=${page}`;
       const searchRes = await axios.get(searchUrl, { headers, timeout: 8000 });
       
       if (searchRes.data?.js?.data && Array.isArray(searchRes.data.js.data)) {
         const movies = searchRes.data.js.data;
-        if (movies.length === 0) break; // If page is empty, stop searching
+        if (movies.length === 0) break;
 
         for (let movie of movies) {
           const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 8000 });
@@ -73,18 +74,23 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
             const rawCmd = linkRes.data.js.cmd;
             const match = rawCmd.match(/https?:\/\/[^\s]+/);
             
-            if (match) {
-              const quality = extractQuality(movie.name);
+            if (match && !seenUrls.has(match[0])) {
+              seenUrls.add(match[0]);
+              
+              const rawTitle = movie.name || "Unknown Title";
+              const quality = extractQuality(rawTitle);
+              
               results.push({ 
                 name: `Nuvio [${quality}]`, 
-                title: `[STALKER]\n${movie.name}`, 
+                // Appending the results length guarantees Stremio CANNOT group/hide identical titles
+                title: `${rawTitle}\n🔗 Link ${results.length + 1}`, 
                 url: match[0] 
               });
             }
           }
         }
       } else {
-        break; // Stop if the API response is invalid
+        break;
       }
     }
     return results;
@@ -95,7 +101,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
 }
 
 // ---------------------------------------------------------
-// M3U SEARCH
+// M3U SEARCH (Fixed to force all links to show)
 // ---------------------------------------------------------
 async function searchM3U(playlistUrl, searchQuery) {
   try {
@@ -115,9 +121,10 @@ async function searchM3U(playlistUrl, searchQuery) {
         if (streamUrl.startsWith('http')) {
           const rawTitle = lines[i].split(',').pop().trim();
           const quality = extractQuality(rawTitle);
+          
           results.push({ 
             name: `Nuvio [${quality}]`, 
-            title: `[M3U]\n${rawTitle}`, 
+            title: `${rawTitle}\n🔗 Link ${results.length + 1}`, 
             url: streamUrl 
           });
         }
@@ -131,13 +138,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.nuvio.error', version: '4.2.0', name: 'Nuvio (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.nuvio.error', version: '4.3.0', name: 'Nuvio (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
     id: `org.nuvio.stateless`,
-    version: '4.2.0',
+    version: '4.3.0',
     name: `Nuvio 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD. Now with 4K Detection.',
+    description: 'Cloud engine for Stalker and M3U VOD. Shows ALL links and exact provider titles.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -167,7 +174,7 @@ app.get('/configure', (req, res) => {
     <html>
     <head><title>Nuvio</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-indigo-500 mb-6">NUVIO <span class="text-xs text-indigo-200">v4.2 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-indigo-500 mb-6">NUVIO <span class="text-xs text-indigo-200">v4.3 Max Links Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
       <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm hover:bg-slate-700 transition">+ Add Source</button>
