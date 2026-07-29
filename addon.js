@@ -40,12 +40,11 @@ function extractQuality(title) {
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (v5.2 Deep Pagination & Safety Net)
+// STALKER SEARCH (v5.3 Targeted Sub-Folder Scraper)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
   
-  // THE 7-SECOND SAFETY NET: Ensures Stremio never drops the addon
   return Promise.race([
     new Promise(async (resolve) => {
       try {
@@ -57,47 +56,63 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
         const handshake = await axios.get(`${baseUrl}?type=stb&action=handshake`, { headers, timeout: 5000 }).catch(() => null);
         if (handshake?.data?.js?.token) headers['Authorization'] = `Bearer ${handshake.data.js.token}`;
 
-        // 1. Clean the title and get the most unique word to bypass Stalker SQL crashes
+        // 1. Clean the title for the SQL Wildcard search
         const ignoreWords = ['the', 'and', 'for', 'with', 'part', 'vol', 'chapter', 'of'];
         const queryWords = searchQuery.replace(/[^a-zA-Z0-9\s]/g, ' ')
                                       .split(/\s+/)
                                       .filter(w => w.length > 2 && !ignoreWords.includes(w.toLowerCase()));
         
-        const primaryWord = queryWords[0] || searchQuery.split(' ')[0];
+        let sqlSearch = queryWords.slice(0, 2).join('%');
+        if (!sqlSearch) sqlSearch = searchQuery.replace(/[^a-zA-Z0-9\s]/g, '').trim();
 
-        // 2. DEEP FETCH: Grab Pages 0 through 9 concurrently (Takes ~1.5 seconds)
-        const pagePromises = Array.from({ length: 10 }, (_, i) => i).map(page => 
-          axios.get(`${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(primaryWord)}&p=${page}`, { headers, timeout: 4000 })
+        // 2. SCRAPE AND FILTER CATEGORIES
+        let targetCategories = [{ id: '*', title: 'All' }]; // Always hit root just in case
+        try {
+          const catRes = await axios.get(`${baseUrl}?type=vod&action=get_categories`, { headers, timeout: 4000 });
+          if (catRes.data?.js && Array.isArray(catRes.data.js)) {
+            // Target ONLY folders likely to hold high-quality or relevant VODs
+            const highValueCats = catRes.data.js.filter(c => {
+              const t = c.title.toLowerCase();
+              return /4k|uhd|movie|new|vod|english|en|premium/.test(t);
+            });
+            targetCategories = targetCategories.concat(highValueCats);
+          }
+        } catch (err) {
+          // If they block get_categories, fallback to a few blind guesses to avoid hitting 0 results
+          targetCategories.push({ id: '1', title: 'Hidden 1' }, { id: '2', title: 'Hidden 2' });
+        }
+
+        // Remove duplicates if any
+        const uniqueCats = Array.from(new Map(targetCategories.map(item => [item.id, item])).values());
+        
+        // 3. BATCH SEARCH TARGETED SUB-FOLDERS
+        // We are only sending a few requests now, perfectly under the rate limit.
+        const searchPromises = uniqueCats.map(cat => 
+          axios.get(`${baseUrl}?type=vod&action=get_ordered_list&category=${cat.id}&search=${encodeURIComponent(sqlSearch)}&p=0`, { headers, timeout: 5000 })
+            .then(res => ({ cat, data: res.data }))
             .catch(() => null)
         );
         
-        const pageResponses = await Promise.all(pagePromises);
+        const searchResponses = await Promise.all(searchPromises);
         let allMovies = [];
         const seenCmds = new Set();
         
-        for (const res of pageResponses) {
+        for (const res of searchResponses) {
           if (res?.data?.js?.data && Array.isArray(res.data.js.data)) {
             for (const movie of res.data.js.data) {
               if (!seenCmds.has(movie.cmd)) {
                 seenCmds.add(movie.cmd);
+                movie.categoryName = res.cat.title;
                 allMovies.push(movie);
               }
             }
           }
         }
 
-        // 3. Strict Javascript filtering: Ensure it matches the actual movie requested
-        const filteredMovies = allMovies.filter(m => {
-          const mName = (m.name || '').toLowerCase();
-          let matchCount = 0;
-          queryWords.forEach(qw => { if (mName.includes(qw.toLowerCase())) matchCount++; });
-          return matchCount >= Math.min(2, queryWords.length);
-        });
-
-        if (filteredMovies.length === 0) return resolve([]);
+        if (allMovies.length === 0) return resolve([]);
 
         // 4. PRIORITY SORT: Push 4K and 1080p to the very top
-        filteredMovies.sort((a, b) => {
+        allMovies.sort((a, b) => {
           const nameA = (a.name || "").toLowerCase();
           const nameB = (b.name || "").toLowerCase();
           const scoreA = /4k|uhd|2160/i.test(nameA) ? 3 : /1080/i.test(nameA) ? 2 : /720/i.test(nameA) ? 1 : 0;
@@ -105,13 +120,13 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
           return scoreB - scoreA;
         });
 
-        // 5. Take only the top 10 best versions to save time and avoid timeouts
-        const topMovies = filteredMovies.slice(0, 10);
+        // 5. Cap at 10 to ensure link resolution finishes before Stremio times out
+        const topMovies = allMovies.slice(0, 10);
 
-        // 6. Resolve actual video links for those top 10
+        // 6. RESOLVE DIRECT LINKS
         const linkPromises = topMovies.map(async (movie) => {
           try {
-            const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 4000 });
+            const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 5000 });
             if (linkRes.data?.js?.cmd) {
               const match = linkRes.data.js.cmd.match(/https?:\/\/[^\s]+/);
               if (match) {
@@ -119,7 +134,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
                 const quality = extractQuality(rawTitle);
                 return {
                   name: `[STALKER] ${quality}`,
-                  title: rawTitle,
+                  title: `${rawTitle}\n📂 Found in: ${movie.categoryName}`,
                   url: match[0]
                 };
               }
@@ -148,7 +163,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
         resolve([]);
       }
     }),
-    new Promise(resolve => setTimeout(() => resolve([]), 7000)) // 7-second force return
+    new Promise(resolve => setTimeout(() => resolve([]), 8000)) // Safety net expanded to 8 seconds
   ]);
 }
 
@@ -173,10 +188,12 @@ async function searchM3U(playlistUrl, searchQuery) {
         if (streamUrl.startsWith('http')) {
           const rawTitle = lines[i].split(',').pop().trim();
           const quality = extractQuality(rawTitle);
+          const groupMatch = lines[i].match(/group-title="([^"]+)"/i);
+          const categoryName = groupMatch ? groupMatch[1] : "Playlist";
           
           results.push({ 
             name: `[M3U] ${quality}`, 
-            title: `${rawTitle}\n🔗 Link ${results.length + 1}`, 
+            title: `${rawTitle}\n📂 Found in: ${categoryName}`, 
             url: streamUrl 
           });
         }
@@ -190,13 +207,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '5.2.0', name: 'KingRat (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '5.3.0', name: 'KingRat (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
     id: `org.kingrat.stateless`,
-    version: '5.2.0',
+    version: '5.3.0',
     name: `KingRat 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD. v5.2 Lightning Fetch enabled.',
+    description: 'Cloud engine for Stalker and M3U VOD. Targeted Sub-Folder Scraper enabled.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -226,7 +243,7 @@ app.get('/configure', (req, res) => {
     <html>
     <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v5.2 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v5.3 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
       <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
