@@ -12,9 +12,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------------------------------------------------------
-// STATELESS DECODER (Decodes settings from URL)
-// ---------------------------------------------------------
 function decodeConfig(hexString) {
   try {
     const jsonStr = Buffer.from(hexString, 'hex').toString('utf8');
@@ -34,6 +31,9 @@ async function getMediaMetadata(type, id) {
   }
 }
 
+// ---------------------------------------------------------
+// STALKER SEARCH (FIXED URL PARSER)
+// ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
   try {
@@ -53,12 +53,23 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
       for (let movie of searchRes.data.js.data) {
         const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 8000 });
         if (linkRes.data?.js?.cmd) {
-          results.push({ name: `KingRat 👑`, title: `[STALKER] ${movie.name}`, url: linkRes.data.js.cmd.split(' ')[0] });
+          const rawCmd = linkRes.data.js.cmd;
+          
+          // FIX: Extract the actual http/https URL out of MAG box commands (like "ffrt http://...")
+          const match = rawCmd.match(/https?:\/\/[^\s]+/);
+          if (match) {
+            results.push({ 
+              name: `KingRat 👑`, 
+              title: `[STALKER] ${movie.name}`, 
+              url: match[0] 
+            });
+          }
         }
       }
     }
     return results;
   } catch (err) {
+    console.error(`Stalker Error: ${err.message}`);
     return [];
   }
 }
@@ -89,16 +100,13 @@ async function searchM3U(playlistUrl, searchQuery) {
   }
 }
 
-// ---------------------------------------------------------
-// STREMIO ROUTES (Stateless)
-// ---------------------------------------------------------
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.1.0', name: 'KingRat (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.1.1', name: 'KingRat (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
     id: `org.kingrat.stateless`,
-    version: '4.1.0',
+    version: '4.1.1',
     name: `KingRat 👑 (${config.playlists.length} Sources)`,
     description: 'Cloud engine for Stalker and M3U VOD.',
     resources: ['stream'],
@@ -124,16 +132,13 @@ app.get('/:config/stream/:type/:imdbId.json', async (req, res) => {
 
 app.get('/', (req, res) => res.redirect('/configure'));
 
-// ---------------------------------------------------------
-// CONFIGURATION DASHBOARD
-// ---------------------------------------------------------
 app.get('/configure', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.1 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.1.1 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
       <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
