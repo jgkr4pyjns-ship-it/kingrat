@@ -40,7 +40,7 @@ function extractQuality(title) {
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (True Category Scraper + Anti-Spam Batching)
+// STALKER SEARCH (v5.1 Blind Brute-Force + Wildcard)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
@@ -53,29 +53,46 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     const handshake = await axios.get(`${baseUrl}?type=stb&action=handshake`, { headers, timeout: 8000 });
     if (handshake.data?.js?.token) headers['Authorization'] = `Bearer ${handshake.data.js.token}`;
 
-    const cleanName = searchQuery.replace(/[^a-zA-Z0-9\s]/g, ' ').trim();
-    const queryWords = cleanName.toLowerCase().split(/\s+/);
-    let primaryWord = queryWords[0];
-    if ((primaryWord === 'the' || primaryWord === 'a') && queryWords[1]) primaryWord = queryWords[1];
+    // 1. Generate SQL Wildcard for search (Bypasses provider punctuation crashes)
+    const ignoreWords = ['the', 'and', 'for', 'with', 'part', 'vol', 'chapter', 'of'];
+    const words = searchQuery.replace(/[^a-zA-Z0-9\s]/g, ' ')
+                             .split(/\s+/)
+                             .filter(w => w.length > 2 && !ignoreWords.includes(w.toLowerCase()));
+    
+    let sqlSearch = words.slice(0, 2).join('%');
+    if (!sqlSearch) sqlSearch = searchQuery.replace(/[^a-zA-Z0-9\s]/g, '').trim();
 
+    // 2. Try to get categories normally
     let categories = [];
     try {
-      // 1. Actually fetch the categories this time
       const catRes = await axios.get(`${baseUrl}?type=vod&action=get_categories`, { headers, timeout: 5000 });
       if (catRes.data?.js && Array.isArray(catRes.data.js)) categories = catRes.data.js;
     } catch (err) {}
-    
-    if (categories.length === 0) categories = [{ id: '*', title: 'All' }];
+
+    // Fallback 1: Try get_genres if get_categories is blocked
+    if (categories.length === 0) {
+      try {
+        const genreRes = await axios.get(`${baseUrl}?type=vod&action=get_genres`, { headers, timeout: 5000 });
+        if (genreRes.data?.js && Array.isArray(genreRes.data.js)) categories = genreRes.data.js;
+      } catch (err) {}
+    }
+
+    // Fallback 2: BLIND BRUTE-FORCE. If the provider hides their category list, we guess IDs 0-30.
+    if (categories.length === 0) {
+      for (let i = 0; i <= 30; i++) {
+         categories.push({ id: i.toString(), title: `Hidden Folder ${i}` });
+      }
+    }
 
     let allMovies = [];
     const seenCmds = new Set();
     
-    // 2. Batch fetching 6 categories at a time to stay under anti-spam radar but fast enough for Stremio's 10s timeout
+    // 3. Batch fetch across all categories (6 at a time to avoid anti-spam blocks)
     const BATCH_SIZE = 6;
     for (let i = 0; i < categories.length; i += BATCH_SIZE) {
       const batch = categories.slice(i, i + BATCH_SIZE);
       const batchPromises = batch.map(cat => 
-         axios.get(`${baseUrl}?type=vod&action=get_ordered_list&category=${cat.id}&search=${encodeURIComponent(primaryWord)}&p=0`, { headers, timeout: 5000 })
+         axios.get(`${baseUrl}?type=vod&action=get_ordered_list&category=${cat.id}&search=${encodeURIComponent(sqlSearch)}&p=0`, { headers, timeout: 5000 })
            .then(res => ({ cat, data: res.data }))
            .catch(() => null)
       );
@@ -94,23 +111,25 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
       }
     }
 
-    // 3. Strict javascript matching to bypass provider SQL search bugs
-    const filteredMovies = allMovies.filter(m => {
-      const mName = (m.name || '').toLowerCase();
-      let matchCount = 0;
-      queryWords.forEach(qw => { if (mName.includes(qw)) matchCount++; });
-      return matchCount >= Math.min(2, queryWords.length);
+    if (allMovies.length === 0) return [];
+
+    // 4. PRIORITY SORT: Push 4K and 1080p to the very top so they are processed first
+    allMovies.sort((a, b) => {
+      const nameA = (a.name || "").toLowerCase();
+      const nameB = (b.name || "").toLowerCase();
+      const scoreA = /4k|uhd|2160/i.test(nameA) ? 3 : /1080/i.test(nameA) ? 2 : /720/i.test(nameA) ? 1 : 0;
+      const scoreB = /4k|uhd|2160/i.test(nameB) ? 3 : /1080/i.test(nameB) ? 2 : /720/i.test(nameB) ? 1 : 0;
+      return scoreB - scoreA;
     });
 
-    // Cap at 15 to ensure we don't hit the 10s Stremio timeout during link resolution
-    const targetMovies = filteredMovies.length > 0 ? filteredMovies.slice(0, 15) : allMovies.slice(0, 10);
-    if (targetMovies.length === 0) return [];
+    // 5. Cap at 15 to guarantee Stremio never times out
+    const topMovies = allMovies.slice(0, 15);
 
-    // 4. Resolve links in batches of 5
+    // 6. Resolve links in batches of 5
     let resolvedLinks = [];
     const LINK_BATCH_SIZE = 5;
-    for (let i = 0; i < targetMovies.length; i += LINK_BATCH_SIZE) {
-       const batch = targetMovies.slice(i, i + LINK_BATCH_SIZE);
+    for (let i = 0; i < topMovies.length; i += LINK_BATCH_SIZE) {
+       const batch = topMovies.slice(i, i + LINK_BATCH_SIZE);
        const linkPromises = batch.map(async (movie) => {
          try {
            const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 6000 });
@@ -121,7 +140,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
                const quality = extractQuality(rawTitle);
                return {
                  name: `[STALKER] ${quality}`,
-                 title: `${rawTitle}\n📂 Found in: ${movie.categoryName || "Root"}`,
+                 title: `${rawTitle}\n📂 Found in: ${movie.categoryName}`,
                  url: match[0]
                };
              }
@@ -137,6 +156,8 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     
     let results = [];
     const seenUrls = new Set();
+    
+    // Deduplicate identical video files
     resolvedLinks.forEach(link => {
       if (link && !seenUrls.has(link.url)) {
         seenUrls.add(link.url);
@@ -191,13 +212,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.9.0', name: 'KingRat (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '5.1.0', name: 'KingRat (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
     id: `org.kingrat.stateless`,
-    version: '4.9.0',
+    version: '5.1.0',
     name: `KingRat 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD. True Category Search and rate-limit bypassing.',
+    description: 'Cloud engine for Stalker and M3U VOD. v5.1 Blind Category Brute-Forcing enabled.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -227,7 +248,7 @@ app.get('/configure', (req, res) => {
     <html>
     <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.9 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v5.1 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
       <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
