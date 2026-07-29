@@ -40,7 +40,7 @@ function extractQuality(title) {
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (Parallel Fetching to beat Stremio Timeout)
+// STALKER SEARCH (Fixed: Parallel Fetch + All Categories)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
@@ -55,9 +55,9 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
 
     const safeSearchQuery = searchQuery.replace(/[:\-'.]/g, ' ').replace(/\s+/g, ' ').trim();
     
-    // FETCH PAGES 0-3 SIMULTANEOUSLY (Speeds up search by 4x)
+    // CRITICAL FIX: Re-added &category=* to the parallel fetch loop
     const pagePromises = [0, 1, 2, 3].map(page => 
-      axios.get(`${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(safeSearchQuery)}&p=${page}`, { headers, timeout: 6000 })
+      axios.get(`${baseUrl}?type=vod&action=get_ordered_list&category=*&search=${encodeURIComponent(safeSearchQuery)}&p=${page}`, { headers, timeout: 6000 })
         .catch(() => null)
     );
     
@@ -72,7 +72,6 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
 
     if (allMovies.length === 0) return [];
 
-    // RESOLVE ALL LINKS SIMULTANEOUSLY (Beats Stremio's 10s cutoff)
     const linkPromises = allMovies.map(async (movie) => {
       try {
         const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 6000 });
@@ -84,7 +83,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
             const quality = extractQuality(rawTitle);
             return {
               name: `[STALKER] ${quality}`,
-              title: rawTitle, // Keeps exactly what the provider named it
+              title: rawTitle,
               url: match[0]
             };
           }
@@ -100,7 +99,6 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     let results = [];
     const seenUrls = new Set();
 
-    // Clean up results and enforce Stremio doesn't hide duplicates
     resolvedLinks.forEach(link => {
       if (link && !seenUrls.has(link.url)) {
         seenUrls.add(link.url);
@@ -154,13 +152,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.5.0', name: 'KingRat (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.6.0', name: 'KingRat (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
     id: `org.kingrat.stateless`,
-    version: '4.5.0',
+    version: '4.6.0',
     name: `KingRat 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD. Parallel fetching enabled for maximum links.',
+    description: 'Cloud engine for Stalker and M3U VOD. Parallel fetching and global categories enabled.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -190,7 +188,7 @@ app.get('/configure', (req, res) => {
     <html>
     <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.5 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.6 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
       <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
