@@ -40,7 +40,7 @@ function extractQuality(title) {
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (Fixed: Parallel Fetch + All Categories)
+// STALKER SEARCH (Brute-Force Category Scraper)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
@@ -55,23 +55,43 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
 
     const safeSearchQuery = searchQuery.replace(/[:\-'.]/g, ' ').replace(/\s+/g, ' ').trim();
     
-    // CRITICAL FIX: Re-added &category=* to the parallel fetch loop
-    const pagePromises = [0, 1, 2, 3].map(page => 
-      axios.get(`${baseUrl}?type=vod&action=get_ordered_list&category=*&search=${encodeURIComponent(safeSearchQuery)}&p=${page}`, { headers, timeout: 6000 })
+    // STEP 1: SCRAPE ALL FOLDER IDs
+    let categoryIds = ['0']; // Always default to root just in case
+    try {
+      const catRes = await axios.get(`${baseUrl}?type=vod&action=get_categories`, { headers, timeout: 5000 });
+      if (catRes.data?.js && Array.isArray(catRes.data.js)) {
+        // Extract every single folder ID on their server
+        categoryIds = catRes.data.js.map(c => c.id);
+      }
+    } catch (err) {
+      console.log("Failed to scrape categories, falling back to root.");
+    }
+
+    // STEP 2: SEARCH EVERY FOLDER SIMULTANEOUSLY
+    const searchPromises = categoryIds.map(catId => 
+      axios.get(`${baseUrl}?type=vod&action=get_ordered_list&category=${catId}&search=${encodeURIComponent(safeSearchQuery)}&p=0`, { headers, timeout: 6000 })
         .catch(() => null)
     );
     
-    const pageResponses = await Promise.all(pagePromises);
+    const searchResponses = await Promise.all(searchPromises);
     let allMovies = [];
+    const seenCmds = new Set();
     
-    for (const res of pageResponses) {
+    // Collect all unique movies found across all folders
+    for (const res of searchResponses) {
       if (res && res.data?.js?.data && Array.isArray(res.data.js.data)) {
-        allMovies.push(...res.data.js.data);
+        for (const movie of res.data.js.data) {
+          if (!seenCmds.has(movie.cmd)) {
+            seenCmds.add(movie.cmd);
+            allMovies.push(movie);
+          }
+        }
       }
     }
 
     if (allMovies.length === 0) return [];
 
+    // STEP 3: RESOLVE ALL LINKS SIMULTANEOUSLY
     const linkPromises = allMovies.map(async (movie) => {
       try {
         const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 6000 });
@@ -83,7 +103,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
             const quality = extractQuality(rawTitle);
             return {
               name: `[STALKER] ${quality}`,
-              title: rawTitle,
+              title: rawTitle, // Exact provider title
               url: match[0]
             };
           }
@@ -99,6 +119,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     let results = [];
     const seenUrls = new Set();
 
+    // Deduplicate exact video URLs so Stremio doesn't merge them
     resolvedLinks.forEach(link => {
       if (link && !seenUrls.has(link.url)) {
         seenUrls.add(link.url);
@@ -152,13 +173,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.6.0', name: 'KingRat (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.7.0', name: 'KingRat (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
     id: `org.kingrat.stateless`,
-    version: '4.6.0',
+    version: '4.7.0',
     name: `KingRat 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD. Parallel fetching and global categories enabled.',
+    description: 'Cloud engine for Stalker and M3U VOD. True Global Category search enabled.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -188,7 +209,7 @@ app.get('/configure', (req, res) => {
     <html>
     <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.6 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.7 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
       <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
