@@ -32,7 +32,18 @@ async function getMediaMetadata(type, id) {
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (FIXED URL PARSER)
+// QUALITY EXTRACTOR (Prevents Stremio from hiding streams)
+// ---------------------------------------------------------
+function extractQuality(title) {
+  const t = title.toLowerCase();
+  if (t.includes('4k') || t.includes('uhd') || t.includes('2160p')) return '4K UHD 💎';
+  if (t.includes('1080p') || t.includes('fhd')) return '1080p FHD';
+  if (t.includes('720p') || t.includes('hd')) return '720p HD';
+  return 'SD / Unknown';
+}
+
+// ---------------------------------------------------------
+// STALKER SEARCH (Upgraded to fetch multiple pages)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
@@ -45,26 +56,35 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     const handshake = await axios.get(`${baseUrl}?type=stb&action=handshake`, { headers, timeout: 8000 });
     if (handshake.data?.js?.token) headers['Authorization'] = `Bearer ${handshake.data.js.token}`;
 
-    const searchUrl = `${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(searchQuery)}`;
-    const searchRes = await axios.get(searchUrl, { headers, timeout: 8000 });
-    
     let results = [];
-    if (searchRes.data?.js?.data && Array.isArray(searchRes.data.js.data)) {
-      for (let movie of searchRes.data.js.data) {
-        const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 8000 });
-        if (linkRes.data?.js?.cmd) {
-          const rawCmd = linkRes.data.js.cmd;
-          
-          // FIX: Extract the actual http/https URL out of MAG box commands (like "ffrt http://...")
-          const match = rawCmd.match(/https?:\/\/[^\s]+/);
-          if (match) {
-            results.push({ 
-              name: `KingRat 👑`, 
-              title: `[STALKER] ${movie.name}`, 
-              url: match[0] 
-            });
+    
+    // Loop through up to 4 pages to bypass the 14-item Stalker limit
+    for (let page = 1; page <= 4; page++) {
+      const searchUrl = `${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(searchQuery)}&p=${page}`;
+      const searchRes = await axios.get(searchUrl, { headers, timeout: 8000 });
+      
+      if (searchRes.data?.js?.data && Array.isArray(searchRes.data.js.data)) {
+        const movies = searchRes.data.js.data;
+        if (movies.length === 0) break; // If page is empty, stop searching
+
+        for (let movie of movies) {
+          const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 8000 });
+          if (linkRes.data?.js?.cmd) {
+            const rawCmd = linkRes.data.js.cmd;
+            const match = rawCmd.match(/https?:\/\/[^\s]+/);
+            
+            if (match) {
+              const quality = extractQuality(movie.name);
+              results.push({ 
+                name: `Nuvio [${quality}]`, 
+                title: `[STALKER]\n${movie.name}`, 
+                url: match[0] 
+              });
+            }
           }
         }
+      } else {
+        break; // Stop if the API response is invalid
       }
     }
     return results;
@@ -74,6 +94,9 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
   }
 }
 
+// ---------------------------------------------------------
+// M3U SEARCH
+// ---------------------------------------------------------
 async function searchM3U(playlistUrl, searchQuery) {
   try {
     const response = await axios.get(playlistUrl, { responseType: 'text', timeout: 10000 });
@@ -90,7 +113,13 @@ async function searchM3U(playlistUrl, searchQuery) {
           offset++;
         }
         if (streamUrl.startsWith('http')) {
-          results.push({ name: `KingRat 👑`, title: `[M3U] ${lines[i].split(',').pop().trim()}`, url: streamUrl });
+          const rawTitle = lines[i].split(',').pop().trim();
+          const quality = extractQuality(rawTitle);
+          results.push({ 
+            name: `Nuvio [${quality}]`, 
+            title: `[M3U]\n${rawTitle}`, 
+            url: streamUrl 
+          });
         }
       }
     }
@@ -102,13 +131,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.1.1', name: 'KingRat (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.nuvio.error', version: '4.2.0', name: 'Nuvio (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
-    id: `org.kingrat.stateless`,
-    version: '4.1.1',
-    name: `KingRat 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD.',
+    id: `org.nuvio.stateless`,
+    version: '4.2.0',
+    name: `Nuvio 👑 (${config.playlists.length} Sources)`,
+    description: 'Cloud engine for Stalker and M3U VOD. Now with 4K Detection.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -136,16 +165,16 @@ app.get('/configure', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
-    <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
+    <head><title>Nuvio</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.1.1 Cloud Edition</span></h1>
+      <h1 class="text-3xl font-black text-indigo-500 mb-6">NUVIO <span class="text-xs text-indigo-200">v4.2 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
-      <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
+      <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm hover:bg-slate-700 transition">+ Add Source</button>
       <div class="mt-8 pt-6 border-t border-slate-800">
-        <button onclick="generateUrl()" class="w-full bg-amber-500 text-slate-950 font-black py-3 rounded">Generate Manifest URL</button>
-        <div id="resultBox" class="hidden mt-4 space-y-2 p-4 bg-slate-900 border border-amber-500/30 rounded">
-          <input type="text" id="manifestUrl" readonly class="w-full bg-slate-950 p-2 text-amber-400 font-mono text-xs" />
+        <button onclick="generateUrl()" class="w-full bg-indigo-500 hover:bg-indigo-400 text-slate-950 font-black py-3 rounded transition">Generate Manifest URL</button>
+        <div id="resultBox" class="hidden mt-4 space-y-2 p-4 bg-slate-900 border border-indigo-500/30 rounded">
+          <input type="text" id="manifestUrl" readonly class="w-full bg-slate-950 p-2 text-indigo-400 font-mono text-xs focus:outline-none" />
         </div>
       </div>
       <script>
@@ -156,10 +185,9 @@ app.get('/configure', (req, res) => {
             <select class="type bg-slate-950 text-xs p-1 text-slate-300 w-full mb-2 border border-slate-800">
               <option value="stalker">Stalker Portal</option>
               <option value="m3u">M3U Playlist URL</option>
-              <option value="xtream">Xtream Codes API</option>
             </select>
-            <input type="text" placeholder="Portal URL (http://server.com/c/)" class="url w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-amber-500" />
-            <input type="text" placeholder="MAC Address (00:1A:79:...)" class="creds w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-amber-500" />
+            <input type="text" placeholder="Portal URL (http://server.com/c/)" class="url w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-indigo-500 focus:outline-none" />
+            <input type="text" placeholder="MAC Address (00:1A:79:...)" class="creds w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-indigo-500 focus:outline-none" />
           \`;
           document.getElementById('sources').appendChild(div);
         }
@@ -187,4 +215,4 @@ app.get('/configure', (req, res) => {
 });
 
 const PORT = process.env.PORT || 7000;
-app.listen(PORT, () => console.log(`KingRat Cloud Engine running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Nuvio Cloud Engine running on port ${PORT}`));
