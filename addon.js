@@ -31,9 +31,6 @@ async function getMediaMetadata(type, id) {
   }
 }
 
-// ---------------------------------------------------------
-// QUALITY EXTRACTOR
-// ---------------------------------------------------------
 function extractQuality(title) {
   const t = title.toLowerCase();
   if (/4k|uhd|2160/.test(t)) return '4K';
@@ -43,7 +40,7 @@ function extractQuality(title) {
 }
 
 // ---------------------------------------------------------
-// STALKER SEARCH (Fixed Page 0 Bug & Deduplication)
+// STALKER SEARCH (Parallel Fetching to beat Stremio Timeout)
 // ---------------------------------------------------------
 async function searchStalker(portalUrl, macAddress, searchQuery) {
   if (!macAddress) return [];
@@ -56,43 +53,62 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
     const handshake = await axios.get(`${baseUrl}?type=stb&action=handshake`, { headers, timeout: 8000 });
     if (handshake.data?.js?.token) headers['Authorization'] = `Bearer ${handshake.data.js.token}`;
 
-    let results = [];
-    const seenUrls = new Set(); // Prevents duplicates if the portal ignores pagination
+    const safeSearchQuery = searchQuery.replace(/[:\-'.]/g, ' ').replace(/\s+/g, ' ').trim();
     
-    // FIX: Start at page 0! Many portals skip the first 14 results if you start at p=1.
-    for (let page = 0; page <= 5; page++) {
-      const searchUrl = `${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(searchQuery)}&p=${page}`;
-      const searchRes = await axios.get(searchUrl, { headers, timeout: 8000 });
-      
-      if (searchRes.data?.js?.data && Array.isArray(searchRes.data.js.data)) {
-        const movies = searchRes.data.js.data;
-        if (movies.length === 0) break;
-
-        for (let movie of movies) {
-          const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 8000 });
-          if (linkRes.data?.js?.cmd) {
-            const rawCmd = linkRes.data.js.cmd;
-            const match = rawCmd.match(/https?:\/\/[^\s]+/);
-            
-            if (match && !seenUrls.has(match[0])) {
-              seenUrls.add(match[0]);
-              
-              const rawTitle = movie.name || "Unknown Title";
-              const quality = extractQuality(rawTitle);
-              
-              results.push({ 
-                name: `Nuvio [${quality}]`, 
-                // Appending the results length guarantees Stremio CANNOT group/hide identical titles
-                title: `${rawTitle}\n🔗 Link ${results.length + 1}`, 
-                url: match[0] 
-              });
-            }
-          }
-        }
-      } else {
-        break;
+    // FETCH PAGES 0-3 SIMULTANEOUSLY (Speeds up search by 4x)
+    const pagePromises = [0, 1, 2, 3].map(page => 
+      axios.get(`${baseUrl}?type=vod&action=get_ordered_list&search=${encodeURIComponent(safeSearchQuery)}&p=${page}`, { headers, timeout: 6000 })
+        .catch(() => null)
+    );
+    
+    const pageResponses = await Promise.all(pagePromises);
+    let allMovies = [];
+    
+    for (const res of pageResponses) {
+      if (res && res.data?.js?.data && Array.isArray(res.data.js.data)) {
+        allMovies.push(...res.data.js.data);
       }
     }
+
+    if (allMovies.length === 0) return [];
+
+    // RESOLVE ALL LINKS SIMULTANEOUSLY (Beats Stremio's 10s cutoff)
+    const linkPromises = allMovies.map(async (movie) => {
+      try {
+        const linkRes = await axios.get(`${baseUrl}?type=vod&action=create_link&cmd=${encodeURIComponent(movie.cmd)}`, { headers, timeout: 6000 });
+        if (linkRes.data?.js?.cmd) {
+          const rawCmd = linkRes.data.js.cmd;
+          const match = rawCmd.match(/https?:\/\/[^\s]+/);
+          if (match) {
+            const rawTitle = movie.name || "Unknown Title";
+            const quality = extractQuality(rawTitle);
+            return {
+              name: `[STALKER] ${quality}`,
+              title: rawTitle, // Keeps exactly what the provider named it
+              url: match[0]
+            };
+          }
+        }
+      } catch (err) {
+        return null;
+      }
+      return null;
+    });
+
+    const resolvedLinks = await Promise.all(linkPromises);
+    
+    let results = [];
+    const seenUrls = new Set();
+
+    // Clean up results and enforce Stremio doesn't hide duplicates
+    resolvedLinks.forEach(link => {
+      if (link && !seenUrls.has(link.url)) {
+        seenUrls.add(link.url);
+        link.title = `${link.title}\n🔗 Link ${results.length + 1}`;
+        results.push(link);
+      }
+    });
+
     return results;
   } catch (err) {
     console.error(`Stalker Error: ${err.message}`);
@@ -101,7 +117,7 @@ async function searchStalker(portalUrl, macAddress, searchQuery) {
 }
 
 // ---------------------------------------------------------
-// M3U SEARCH (Fixed to force all links to show)
+// M3U SEARCH
 // ---------------------------------------------------------
 async function searchM3U(playlistUrl, searchQuery) {
   try {
@@ -123,7 +139,7 @@ async function searchM3U(playlistUrl, searchQuery) {
           const quality = extractQuality(rawTitle);
           
           results.push({ 
-            name: `Nuvio [${quality}]`, 
+            name: `[M3U] ${quality}`, 
             title: `${rawTitle}\n🔗 Link ${results.length + 1}`, 
             url: streamUrl 
           });
@@ -138,13 +154,13 @@ async function searchM3U(playlistUrl, searchQuery) {
 
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
-  if (!config) return res.status(200).json({ id: 'org.nuvio.error', version: '4.3.0', name: 'Nuvio (Invalid)', resources: [], types: [] });
+  if (!config) return res.status(200).json({ id: 'org.kingrat.error', version: '4.5.0', name: 'KingRat (Invalid)', resources: [], types: [] });
 
   res.status(200).json({
-    id: `org.nuvio.stateless`,
-    version: '4.3.0',
-    name: `Nuvio 👑 (${config.playlists.length} Sources)`,
-    description: 'Cloud engine for Stalker and M3U VOD. Shows ALL links and exact provider titles.',
+    id: `org.kingrat.stateless`,
+    version: '4.5.0',
+    name: `KingRat 👑 (${config.playlists.length} Sources)`,
+    description: 'Cloud engine for Stalker and M3U VOD. Parallel fetching enabled for maximum links.',
     resources: ['stream'],
     types: ['movie', 'series'],
     idPrefixes: ['tt']
@@ -172,16 +188,16 @@ app.get('/configure', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
-    <head><title>Nuvio</title><script src="https://cdn.tailwindcss.com"></script></head>
+    <head><title>KingRat</title><script src="https://cdn.tailwindcss.com"></script></head>
     <body class="bg-slate-950 text-white p-8 max-w-2xl mx-auto font-sans">
-      <h1 class="text-3xl font-black text-indigo-500 mb-6">NUVIO <span class="text-xs text-indigo-200">v4.3 Max Links Edition</span></h1>
+      <h1 class="text-3xl font-black text-amber-500 mb-6">KING RAT <span class="text-xs text-amber-200">v4.5 Cloud Edition</span></h1>
       <p class="text-sm text-slate-400 mb-6">Make sure your Stalker URL has a valid domain (e.g. .com or .tv) and put the MAC Address in the second box.</p>
       <div id="sources" class="space-y-4"></div>
-      <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm hover:bg-slate-700 transition">+ Add Source</button>
+      <button onclick="addSourceRow()" class="mt-4 bg-slate-800 px-4 py-2 rounded text-sm">+ Add Source</button>
       <div class="mt-8 pt-6 border-t border-slate-800">
-        <button onclick="generateUrl()" class="w-full bg-indigo-500 hover:bg-indigo-400 text-slate-950 font-black py-3 rounded transition">Generate Manifest URL</button>
-        <div id="resultBox" class="hidden mt-4 space-y-2 p-4 bg-slate-900 border border-indigo-500/30 rounded">
-          <input type="text" id="manifestUrl" readonly class="w-full bg-slate-950 p-2 text-indigo-400 font-mono text-xs focus:outline-none" />
+        <button onclick="generateUrl()" class="w-full bg-amber-500 text-slate-950 font-black py-3 rounded">Generate Manifest URL</button>
+        <div id="resultBox" class="hidden mt-4 space-y-2 p-4 bg-slate-900 border border-amber-500/30 rounded">
+          <input type="text" id="manifestUrl" readonly class="w-full bg-slate-950 p-2 text-amber-400 font-mono text-xs" />
         </div>
       </div>
       <script>
@@ -193,8 +209,8 @@ app.get('/configure', (req, res) => {
               <option value="stalker">Stalker Portal</option>
               <option value="m3u">M3U Playlist URL</option>
             </select>
-            <input type="text" placeholder="Portal URL (http://server.com/c/)" class="url w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-indigo-500 focus:outline-none" />
-            <input type="text" placeholder="MAC Address (00:1A:79:...)" class="creds w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-indigo-500 focus:outline-none" />
+            <input type="text" placeholder="Portal URL (http://server.com/c/)" class="url w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-amber-500" />
+            <input type="text" placeholder="MAC Address (00:1A:79:...)" class="creds w-full bg-slate-950 p-2 text-sm border border-slate-800 focus:border-amber-500" />
           \`;
           document.getElementById('sources').appendChild(div);
         }
@@ -222,4 +238,4 @@ app.get('/configure', (req, res) => {
 });
 
 const PORT = process.env.PORT || 7000;
-app.listen(PORT, () => console.log(`Nuvio Cloud Engine running on port ${PORT}`));
+app.listen(PORT, () => console.log(`KingRat Cloud Engine running on port ${PORT}`));
